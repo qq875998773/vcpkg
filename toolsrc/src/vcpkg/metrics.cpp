@@ -155,8 +155,6 @@ namespace vcpkg::Metrics
         Json::Array buildtime_names;
         Json::Array buildtime_times;
 
-        Json::Object feature_flags;
-
         void track_property(const std::string& name, const std::string& value)
         {
             properties.insert_or_replace(name, Json::Value::string(value));
@@ -174,7 +172,7 @@ namespace vcpkg::Metrics
         }
         void track_feature(const std::string& name, bool value)
         {
-            feature_flags.insert(name, Json::Value::boolean(value));
+            properties.insert("feature-flag-" + name, Json::Value::boolean(value));
         }
 
         std::string format_event_data_template() const
@@ -234,7 +232,6 @@ namespace vcpkg::Metrics
                 base_data.insert("name", Json::Value::string("commandline_test7"));
                 base_data.insert("properties", std::move(props_plus_buildtimes));
                 base_data.insert("measurements", measurements);
-                base_data.insert("feature-flags", feature_flags);
             }
 
             return Json::stringify(arr, vcpkg::Json::JsonStyle());
@@ -243,37 +240,14 @@ namespace vcpkg::Metrics
 
     static MetricMessage g_metricmessage;
     static bool g_should_send_metrics =
-#if defined(NDEBUG) && (VCPKG_DISABLE_METRICS == 0)
+#if defined(NDEBUG)
         true
 #else
         false
 #endif
         ;
     static bool g_should_print_metrics = false;
-    static bool g_metrics_disabled =
-#if VCPKG_DISABLE_METRICS
-        true
-#else
-        false
-#endif
-        ;
-
-    // for child vcpkg processes, we also want to disable metrics
-    static void set_vcpkg_disable_metrics_environment_variable(bool disabled)
-    {
-#if defined(_WIN32)
-        SetEnvironmentVariableW(L"VCPKG_DISABLE_METRICS", disabled ? L"1" : nullptr);
-#else
-        if (disabled)
-        {
-            setenv("VCPKG_DISABLE_METRICS", "1", true);
-        }
-        else
-        {
-            unsetenv("VCPKG_DISABLE_METRICS");
-        }
-#endif
-    }
+    static bool g_metrics_disabled = false;
 
     std::string get_MAC_user()
     {
@@ -283,7 +257,7 @@ namespace vcpkg::Metrics
             return "{}";
         }
 
-        auto getmac = System::cmd_execute_and_capture_output("getmac");
+        auto getmac = System::cmd_execute_and_capture_output(System::Command("getmac"));
 
         if (getmac.exit_code != 0) return "0";
 
@@ -323,20 +297,9 @@ namespace vcpkg::Metrics
 
     void Metrics::set_print_metrics(bool should_print_metrics) { g_should_print_metrics = should_print_metrics; }
 
-    void Metrics::set_disabled(bool disabled)
-    {
-        set_vcpkg_disable_metrics_environment_variable(disabled);
-        g_metrics_disabled = disabled;
-    }
+    void Metrics::set_disabled(bool disabled) { g_metrics_disabled = disabled; }
 
-    bool Metrics::metrics_enabled()
-    {
-#if VCPKG_DISABLE_METRICS
-        return false;
-#else
-        return !g_metrics_disabled;
-#endif
-    }
+    bool Metrics::metrics_enabled() { return !g_metrics_disabled; }
 
     void Metrics::track_metric(const std::string& name, double value)
     {
@@ -491,50 +454,47 @@ namespace vcpkg::Metrics
 
         const fs::path temp_folder_path = fs::path(temp_folder) / "vcpkg";
         const fs::path temp_folder_path_exe =
-            temp_folder_path / Strings::format("vcpkgmetricsuploader-%s.exe", Commands::Version::base_version());
+            temp_folder_path / Strings::format("vcpkg-%s.exe", Commands::Version::base_version());
 #endif
 
-#if defined(_WIN32)
-
-        const fs::path exe_path = [&fs]() -> fs::path {
-            auto vcpkgdir = System::get_exe_path_of_current_process().parent_path();
-            auto path = vcpkgdir / "vcpkgmetricsuploader.exe";
-            if (fs.exists(path)) return path;
-
-            path = vcpkgdir / "scripts" / "vcpkgmetricsuploader.exe";
-            if (fs.exists(path)) return path;
-
-            return "";
-        }();
-
         std::error_code ec;
+#if defined(_WIN32)
         fs.create_directories(temp_folder_path, ec);
         if (ec) return;
-        fs.copy_file(exe_path, temp_folder_path_exe, fs::copy_options::skip_existing, ec);
+        fs.copy_file(
+            System::get_exe_path_of_current_process(), temp_folder_path_exe, fs::copy_options::skip_existing, ec);
         if (ec) return;
 #else
         if (!fs.exists("/tmp")) return;
         const fs::path temp_folder_path = "/tmp/vcpkg";
-        std::error_code ec;
-        fs.create_directory(temp_folder_path, ec);
-        // ignore error
-        ec.clear();
+        fs.create_directory(temp_folder_path, ignore_errors);
 #endif
         const fs::path vcpkg_metrics_txt_path = temp_folder_path / ("vcpkg" + generate_random_UUID() + ".txt");
         fs.write_contents(vcpkg_metrics_txt_path, payload, ec);
         if (ec) return;
 
 #if defined(_WIN32)
-        const std::string cmd_line = Strings::format("cmd /c \"start \"vcpkgmetricsuploader.exe\" \"%s\" \"%s\"\"",
-                                                     fs::u8string(temp_folder_path_exe),
-                                                     fs::u8string(vcpkg_metrics_txt_path));
-        System::cmd_execute_no_wait(cmd_line);
+        System::Command builder;
+        builder.path_arg(temp_folder_path_exe);
+        builder.string_arg("x-upload-metrics");
+        builder.path_arg(vcpkg_metrics_txt_path);
+        System::cmd_execute_background(builder);
 #else
-        auto escaped_path = Strings::escape_string(fs::u8string(vcpkg_metrics_txt_path), '\'', '\\');
-        const std::string cmd_line = Strings::format(
-            R"((curl "https://dc.services.visualstudio.com/v2/track" -H "Content-Type: application/json" -X POST --tlsv1.2 --data '@%s' >/dev/null 2>&1; rm '%s') &)",
-            escaped_path,
-            escaped_path);
+        // TODO: convert to cmd_execute_background or something.
+        auto curl = System::Command("curl")
+                        .string_arg("https://dc.services.visualstudio.com/v2/track")
+                        .string_arg("-H")
+                        .string_arg("Content-Type: application/json")
+                        .string_arg("-X")
+                        .string_arg("POST")
+                        .string_arg("--tlsv1.2")
+                        .string_arg("--data")
+                        .string_arg(Strings::concat("@", fs::u8string(vcpkg_metrics_txt_path)))
+                        .raw_arg(">/dev/null")
+                        .raw_arg("2>&1");
+        auto remove = System::Command("rm").path_arg(vcpkg_metrics_txt_path);
+        System::Command cmd_line;
+        cmd_line.raw_arg("(").raw_arg(curl.command_line()).raw_arg(";").raw_arg(remove.command_line()).raw_arg(") &");
         System::cmd_execute_clean(cmd_line);
 #endif
     }
